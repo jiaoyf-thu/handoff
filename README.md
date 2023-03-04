@@ -1,2 +1,2 @@
 # handoff
- Transition from PSH fragments to DEM clusters
+ Transition from SPH fragments to DEM clusters
