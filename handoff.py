@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from numpy import linalg as LA
 from alphashape import alphashape
 from scipy.spatial.distance import cdist
+from scipy.linalg import eigh,inv
+from scipy.spatial.transform import Rotation as R
 
 
 '''
@@ -20,26 +22,42 @@ class sph_cluster():
     self.vel = np.zeros(3)      # linear velocity
     self.omg = np.zeros(3)      # angular velocity
     self.J = np.zeros((3,3))    # rotational inertia
+    self.quat = np.zeros(4)     # quaternions: in scalar-last (x, y, z, w) format
+    self.pi = np.zeros(3)       # principle interia
   
   def calc(self):
-    self.mass = np.sum(self.particles.MASS)
-    self.pos = np.array([np.sum(self.particles["X"] * self.particles["MASS"]),\
-                        np.sum(self.particles["Y"] * self.particles["MASS"]),\
-                        np.sum(self.particles["Z"] * self.particles["MASS"])]) / self.mass
-    self.pos = np.array([np.sum(self.particles["VX"] * self.particles["MASS"]),\
-                        np.sum(self.particles["VY"] * self.particles["MASS"]),\
-                        np.sum(self.particles["VZ"] * self.particles["MASS"])]) / self.mass
-    Lox = (self.particles["Y"] * self.particles["VZ"] - self.particles["Z"] * self.particles["VY"]) * self.particles["MASS"]
-    Loy = (self.particles["Z"] * self.particles["VX"] - self.particles["X"] * self.particles["VZ"]) * self.particles["MASS"]
-    Loz = (self.particles["X"] * self.particles["VY"] - self.particles["Y"] * self.particles["VX"]) * self.particles["MASS"]
-    # angular momentum to coordinate origin
-    Lo = np.array([np.sum(Lox), np.sum(Loy), np.sum(Loz)])
-    # angular momentum to center of mass, Lo = Lc + m*cross(r_oc,v_c)
-    Lc = (Lo - self.mass * np.cross(self.pos, self.vel)).transpose()
-    # rotational inertia tensor
-    self.J = self.calc_inertia_tensor(self.particles, self.pos)
-    # calc from Lc = J * omega
-    self.omg = np.matmul(LA.inv(self.J), Lc)
+    if len(self.particles.index) == 1:
+      self.mass = self.particles.iloc[0,self.particles.columns.get_loc("MASS")]
+      self.pos = np.array([self.particles.iloc[0,self.particles.columns.get_loc("X")], \
+                          self.particles.iloc[0,self.particles.columns.get_loc("Y")],\
+                          self.particles.iloc[0,self.particles.columns.get_loc("Z")]])
+      self.vel = np.array([self.particles.iloc[0,self.particles.columns.get_loc("VX")], \
+                          self.particles.iloc[0,self.particles.columns.get_loc("VY")],\
+                          self.particles.iloc[0,self.particles.columns.get_loc("VZ")]])
+      # self.pos = np.array([self.particles.X, self.particles.Y, self.particles.Z])
+      # self.vel = np.array([self.particles.VX, self.particles.VY, self.particles.VZ])
+      self.pi += 2.0/5.0 * self.mass * pow(self.particles.iloc[0,self.particles.columns.get_loc("R")], 2.0)
+    else:
+      self.mass = np.sum(self.particles.MASS)
+      self.pos = np.array([np.sum(self.particles["X"] * self.particles["MASS"]),\
+                          np.sum(self.particles["Y"] * self.particles["MASS"]),\
+                          np.sum(self.particles["Z"] * self.particles["MASS"])]) / self.mass
+      self.vel = np.array([np.sum(self.particles["VX"] * self.particles["MASS"]),\
+                          np.sum(self.particles["VY"] * self.particles["MASS"]),\
+                          np.sum(self.particles["VZ"] * self.particles["MASS"])]) / self.mass
+      Lox = (self.particles["Y"] * self.particles["VZ"] - self.particles["Z"] * self.particles["VY"]) * self.particles["MASS"]
+      Loy = (self.particles["Z"] * self.particles["VX"] - self.particles["X"] * self.particles["VZ"]) * self.particles["MASS"]
+      Loz = (self.particles["X"] * self.particles["VY"] - self.particles["Y"] * self.particles["VX"]) * self.particles["MASS"]
+      # angular momentum to coordinate origin
+      Lo = np.array([np.sum(Lox), np.sum(Loy), np.sum(Loz)])
+      # angular momentum to center of mass, Lo = Lc + m*cross(r_oc,v_c)
+      Lc = (Lo - self.mass * np.cross(self.pos, self.vel)).transpose()
+      # rotational inertia tensor
+      self.J = self.calc_inertia_tensor(self.particles, self.pos)
+      # calc from Lc = J * omega
+      self.omg = np.matmul(LA.inv(self.J), Lc)
+      # calc quaternion
+      self.calc_quaternion()
   
   def calc_inertia_tensor(self, particles, center):
     pp = pd.DataFrame(columns=["X","Y","Z","MASS"])
@@ -56,13 +74,50 @@ class sph_cluster():
     I = np.array([[I_xx, I_xy, I_xz], [I_xy, I_yy, I_yz], [I_xz, I_yz, I_zz]])
     return I
 
+  def calc_quaternion(self):
+    w, v = eigh(self.J)
+    self.pi = w
+    r = R.from_matrix(v)
+    self.quat = r.as_quat()
 
-def load_sph_particles(path, vmax):
+
+def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
   print("1 Load sph particles")
   sph_particles = pd.read_csv(path)
-  if "MASS" not in sph_particles.columns: sph_particles["MASS"] = 1.0
-  sph_particles["VMOD2"] = sph_particles["VX"]*sph_particles["VX"] + sph_particles["VY"]*sph_particles["VY"] + sph_particles["VZ"]*sph_particles["VZ"]
-  isolated_particles = sph_particles[(sph_particles.FRAG == -1) & (sph_particles.VMOD2 < vmax*vmax)]
+  if "MASS" not in sph_particles.columns: sph_particles["MASS"] = mass
+  sph_particles["R"] = 0.5 * dist
+  # move to com
+  com_pos = np.array([np.sum(sph_particles["X"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["Y"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["Z"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+  com_vel = np.array([np.sum(sph_particles["VX"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["VY"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["VZ"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+  sph_particles["X"] -= com_pos[0]
+  sph_particles["Y"] -= com_pos[1]
+  sph_particles["Z"] -= com_pos[2]
+  sph_particles["VX"] -= com_vel[0]
+  sph_particles["VY"] -= com_vel[1]
+  sph_particles["VZ"] -= com_vel[2]
+  # delete too fast particles
+  sph_particles["V2COM"] = (sph_particles["VX"]*sph_particles["X"] + sph_particles["VY"]*sph_particles["Y"] + sph_particles["VZ"]*sph_particles["Z"]) /\
+                           np.sqrt(sph_particles["X"]*sph_particles["X"] + sph_particles["Y"]*sph_particles["Y"] + sph_particles["Z"]*sph_particles["Z"])
+  sph_particles = sph_particles[~((sph_particles.FRAG == -1) & (sph_particles.V2COM >= vmax))]
+  # move to new com
+  com_pos = np.array([np.sum(sph_particles["X"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["Y"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["Z"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+  com_vel = np.array([np.sum(sph_particles["VX"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["VY"] * sph_particles["MASS"]),\
+                        np.sum(sph_particles["VZ"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+  sph_particles["X"] -= com_pos[0]
+  sph_particles["Y"] -= com_pos[1]
+  sph_particles["Z"] -= com_pos[2]
+  sph_particles["VX"] -= com_vel[0]
+  sph_particles["VY"] -= com_vel[1]
+  sph_particles["VZ"] -= com_vel[2]
+  
+  isolated_particles = sph_particles[sph_particles.FRAG == -1]
   clustered_particles = sph_particles[sph_particles.FRAG >= 0]
 
   print("  Record clustered fragments")
@@ -75,6 +130,7 @@ def load_sph_particles(path, vmax):
   hash = -1
   for i in isolated_particles.index:
     sph_clusters[hash] = sph_cluster(hash, isolated_particles.loc[[i]])
+    sph_clusters[hash].calc()
     hash -= 1
 
   print("  Input %d SPH particles" % len(sph_particles.index))
@@ -91,20 +147,40 @@ class dem_cluster():
     self.pos  = sph_cluster_.pos  # center of mass
     self.vel  = sph_cluster_.vel  # linear velocity
     self.omg  = sph_cluster_.omg  # angular velocity
-    self.J    = sph_cluster_.J    # rotational inertia (suppose particle mass = 1)
+    self.J    = sph_cluster_.J    # rotational inertia
+    self.quat = sph_cluster_.quat # quaternions: in scalar-last (x, y, z, w) format
+    self.pi   = sph_cluster_.pi   # principle interia
   
   def add_particle(self, particle):
     self.grav_particles = pd.concat([self.grav_particles, particle])
 
   def check(self):
+    # modify mass distribution
     coef = self.mass / sum(self.grav_particles.MASS)
     self.grav_particles.MASS *= coef
+    # transfer all particles position into inertia coordinate
+    w, v = eigh(self.J)
+    A = v.transpose()
+    for index in self.grav_particles.index:
+      pos0 = np.array([self.grav_particles.loc[index,"X"], self.grav_particles.loc[index,"Y"], self.grav_particles.loc[index,"Z"]])
+      pos0 -= self.pos
+      pos1 = np.matmul(A,pos0)
+      self.grav_particles.loc[index,"X"] = pos1[0]
+      self.grav_particles.loc[index,"Y"] = pos1[1]
+      self.grav_particles.loc[index,"Z"] = pos1[2]
+    for index in self.edge_particles.index:
+      pos0 = np.array([self.edge_particles.loc[index,"X"], self.edge_particles.loc[index,"Y"], self.edge_particles.loc[index,"Z"]])
+      pos0 -= self.pos
+      pos1 = np.matmul(A,pos0)
+      self.edge_particles.loc[index,"X"] = pos1[0]
+      self.edge_particles.loc[index,"Y"] = pos1[1]
+      self.edge_particles.loc[index,"Z"] = pos1[2]
 
 
 def handoff(sph_clusters, dist, rmin):
   print("2 Start handoff")
-  min_size = 50
-  report_size = 1000
+  min_size = 10
+  report_size = 10
   alpha = 1.0 / (1.0 * dist)
   dem_clusters = {}
 
@@ -114,11 +190,18 @@ def handoff(sph_clusters, dist, rmin):
       sph_clusters[key].particles["R"] = 0.5 * dist
       # directly add edge particles and gravitational particles
       dem_clusters[key] = dem_cluster(key, sph_clusters[key], sph_clusters[key].particles)
-      dem_clusters[key].add_particle(sph_clusters[key].particles)
+      # Suppose only 1 grav_particle
+      particle = sph_clusters[key].particles.iloc[[0]].copy()
+      particle.X = sph_clusters[key].pos[0]
+      particle.Y = sph_clusters[key].pos[1]
+      particle.Z = sph_clusters[key].pos[2]
+      particle.VX = sph_clusters[key].vel[0]
+      particle.VY = sph_clusters[key].vel[1]
+      particle.VZ = sph_clusters[key].vel[2]
+      dem_clusters[key].add_particle(particle)
       continue
 
     # find sph cluster shape and edge particles
-    sph_clusters[key].particles["R"] = 0.5 * dist
     alpha_shape_indices = alphashape(sph_clusters[key].particles[["X","Y","Z"]], alpha)
     edge_particles = sph_clusters[key].particles.iloc[alpha_shape_indices].copy()
     dem_clusters[key] = dem_cluster(key, sph_clusters[key], edge_particles)
@@ -129,6 +212,7 @@ def handoff(sph_clusters, dist, rmin):
     # generate inner dem particles
     while len(inner_particles.index) > 1:
       # calculate edt and find the max inner sphere
+      if len(edge_particles.index)==0: break
       center, radius, inner_particles = edt(inner_particles, edge_particles)
       radius += 0.5*dist
       if radius < rmin: break
@@ -155,22 +239,30 @@ def handoff(sph_clusters, dist, rmin):
       # remove sphere particles from inner particles
       inner_particles = inner_particles.drop(index=sphere_particles.index)
 
-    # dem_clusters[key].add_particle(inner_particles)
-    if len(sph_clusters[key].particles.index) > report_size:
+    # in case only 1 grav_particles added, move it to com
+    if len(dem_clusters[key].grav_particles.index) == 1:
+      dem_clusters[key].grav_particles.loc[dem_clusters[key].grav_particles.index[0],"X"] = dem_clusters[key].pos[0]
+      dem_clusters[key].grav_particles.loc[dem_clusters[key].grav_particles.index[0],"Y"] = dem_clusters[key].pos[1]
+      dem_clusters[key].grav_particles.loc[dem_clusters[key].grav_particles.index[0],"Z"] = dem_clusters[key].pos[2]
+
+    # in case no grav_particles added
+    if len(dem_clusters[key].grav_particles.index) == 0:
+      particle = sph_clusters[key].particles.iloc[[0]].copy()
+      particle.X = sph_clusters[key].pos[0]
+      particle.Y = sph_clusters[key].pos[1]
+      particle.Z = sph_clusters[key].pos[2]
+      particle.VX = sph_clusters[key].vel[0]
+      particle.VY = sph_clusters[key].vel[1]
+      particle.VZ = sph_clusters[key].vel[2]
+      dem_clusters[key].add_particle(particle)
+
+    # report each cluster's handoff
+    if len(sph_clusters[key].particles.index) >= report_size:
       print("  SPH to DEM: %d -> %d" % (len(sph_clusters[key].particles.index), len(dem_clusters[key].grav_particles.index)))
 
   for key in dem_clusters: dem_clusters[key].check()
 
-  dem_grav_pnum = [len(dem_clusters[key].grav_particles.index) for key in dem_clusters]
-  dem_edge_pnum = [len(dem_clusters[key].edge_particles.index) for key in dem_clusters]
-  print("  Export %d DEM grav_particles" % sum(dem_grav_pnum))
-  print("  Export %d DEM edge_particles" % sum(dem_edge_pnum))
-
-  # test
-  dem_clusters[1].grav_particles.to_csv("./data/grav_particles.csv", index=False, header=True)
-  dem_clusters[1].edge_particles.to_csv("./data/edge_particles.csv", index=False, header=True)
-
-  print("3 Done!")
+  return dem_clusters
 
 
 def edt(inner_particles, edge_particles):
@@ -203,3 +295,38 @@ def edt(inner_particles, edge_particles):
 
   return center, radius, inner_particles
   
+
+def export_dem(dem_clusters):
+  # report handoff results
+  dem_grav_pnum = [len(dem_clusters[key].grav_particles.index) for key in dem_clusters]
+  dem_edge_pnum = [len(dem_clusters[key].edge_particles.index) for key in dem_clusters]
+  print("3 Generate DEM input formats")
+  print("  Export %d DEM grav_particles" % sum(dem_grav_pnum))
+  print("  Export %d DEM edge_particles" % sum(dem_edge_pnum))
+
+  fp1 = open("./data/dem_input/input_assembly_edge.txt", "w")
+  fp2 = open("./data/dem_input/input_points_edge.txt", "w")
+  fp3 = open("./data/dem_input/input_points_grav.txt", "w")
+
+  fp1.write("%d\n" % (len(dem_clusters)))
+  fp3.write("%d\n" % (sum(dem_grav_pnum)))
+
+  for key in dem_clusters:
+    dc = dem_clusters[key]
+    fp1.write("%d %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e\n" % (len(dc.edge_particles.index),\
+            dc.mass, dc.pi[0],dc.pi[1],dc.pi[2], dc.pos[0],dc.pos[1],dc.pos[2], dc.vel[0],dc.vel[1],dc.vel[2],\
+            dc.omg[0],dc.omg[1],dc.omg[2], dc.quat[0],dc.quat[1],dc.quat[2],dc.quat[3]))
+    for index in dc.edge_particles.index:
+      fp2.write("%e %e %e %e %e %e\n" % (dc.mass, 0.4*dc.edge_particles.loc[index,"MASS"]*pow(dc.edge_particles.loc[index,"R"],2.0),\
+               dc.edge_particles.loc[index,"X"],dc.edge_particles.loc[index,"Y"],\
+               dc.edge_particles.loc[index,"Z"], dc.edge_particles.loc[index,"R"]))
+    fp3.write("%d\n" % (len(dc.grav_particles.index)))
+    for index in dc.grav_particles.index:
+      fp3.write("%e %e %e %e\n" % (dc.grav_particles.loc[index,"MASS"], dc.grav_particles.loc[index,"X"],dc.grav_particles.loc[index,"Y"],\
+               dc.grav_particles.loc[index,"Z"]))
+
+  fp1.close()
+  fp2.close()
+  fp3.close()
+
+  print("4 Done!")
