@@ -1,11 +1,11 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from numpy import linalg as LA
-from alphashape import alphashape
-from scipy.spatial.distance import cdist
-from scipy.linalg import eigh,inv
+from scipy.spatial.distance import cdist,euclidean
+from scipy.spatial import KDTree
+from scipy.linalg import eigh,inv,norm
 from scipy.spatial.transform import Rotation as R
+import open3d as o3d
 
 
 '''
@@ -22,7 +22,7 @@ class sph_cluster():
     self.vel = np.zeros(3)      # linear velocity
     self.omg = np.zeros(3)      # angular velocity
     self.J = np.zeros((3,3))    # rotational inertia
-    self.quat = np.zeros(4)     # quaternions: in scalar-last (x, y, z, w) format
+    self.quat = np.array([0.0,0.0,0.0,1.0])     # quaternions: in scalar-last (x, y, z, w) format
     self.pi = np.zeros(3)       # principle interia
   
   def calc(self):
@@ -55,7 +55,7 @@ class sph_cluster():
       # rotational inertia tensor
       self.J = self.calc_inertia_tensor(self.particles, self.pos)
       # calc from Lc = J * omega
-      self.omg = np.matmul(LA.inv(self.J), Lc)
+      self.omg = np.matmul(inv(self.J), Lc)
       # calc quaternion
       self.calc_quaternion()
   
@@ -79,6 +79,7 @@ class sph_cluster():
     self.pi = w
     r = R.from_matrix(v)
     self.quat = r.as_quat()
+    # print(self.hash, v, r.as_matrix())
 
 
 def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
@@ -139,10 +140,10 @@ def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
 
 
 class dem_cluster():
-  def __init__(self, hash, sph_cluster_, edge_particles):
+  def __init__(self, hash, sph_cluster_, mesh=None):
     self.hash = hash              # cluster hash
-    self.edge_particles = edge_particles                                # edge particles for contact only
-    self.grav_particles = pd.DataFrame(columns=edge_particles.columns)  # particles for gravity only
+    # self.edge_particles = pd.DataFrame(columns=sph_cluster_.particles.columns)  # edge particles for contact only
+    self.grav_particles = pd.DataFrame(columns=sph_cluster_.particles.columns)  # particles for gravity only
     self.mass = sph_cluster_.mass # total mass
     self.pos  = sph_cluster_.pos  # center of mass
     self.vel  = sph_cluster_.vel  # linear velocity
@@ -150,17 +151,38 @@ class dem_cluster():
     self.J    = sph_cluster_.J    # rotational inertia
     self.quat = sph_cluster_.quat # quaternions: in scalar-last (x, y, z, w) format
     self.pi   = sph_cluster_.pi   # principle interia
-  
+    self.mesh = mesh
+    if self.mesh == None:
+      self.edge_particles = sph_cluster_.particles
+    else:
+      self.edge_particles = pd.DataFrame(np.asarray(self.mesh.vertices),columns=["X","Y","Z"])
+
   def add_particle(self, particle):
     self.grav_particles = pd.concat([self.grav_particles, particle])
 
-  def check(self):
+  def check(self, dist, mass):
     # modify mass distribution
     coef = self.mass / sum(self.grav_particles.MASS)
     self.grav_particles.MASS *= coef
+    # move edge particles inside and set them larger
+    if self.mesh != None:
+      # self.edge_particles = pd.DataFrame(np.asarray(self.mesh.vertices),columns=["X","Y","Z"])
+      # # normals = pd.DataFrame(np.asarray(self.mesh.vertex_normals),columns=["NX","NY","NZ"]) # direction random
+      pcd = o3d.geometry.PointCloud()
+      pcd.points = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices))
+      pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=dist*2.0, max_nn=15), fast_normal_computation=False)
+      pcd.orient_normals_consistent_tangent_plane(k=15)
+      normals = pd.DataFrame(np.asarray(pcd.normals),columns=["NX","NY","NZ"])
+      self.edge_particles["X"] -= normals["NX"] * 0.25 * dist
+      self.edge_particles["Y"] -= normals["NY"] * 0.25 * dist
+      self.edge_particles["Z"] -= normals["NZ"] * 0.25 * dist
+      self.edge_particles["R"] = 0.75 * dist
+      self.edge_particles["MASS"] = mass
+
+  def transform(self):
     # transfer all particles position into inertia coordinate
-    w, v = eigh(self.J)
-    A = v.transpose()
+    r = R.from_quat(self.quat)
+    A = (r.as_matrix()).transpose()
     for index in self.grav_particles.index:
       pos0 = np.array([self.grav_particles.loc[index,"X"], self.grav_particles.loc[index,"Y"], self.grav_particles.loc[index,"Z"]])
       pos0 -= self.pos
@@ -177,19 +199,60 @@ class dem_cluster():
       self.edge_particles.loc[index,"Z"] = pos1[2]
 
 
+def check_contact(dem_clusters_):
+  # check particles contact
+  dem_clusters = dem_clusters_.copy()
+  rmax = max([(dem_clusters[key].edge_particles["R"]).max() for key in dem_clusters])
+  rmin = min([(dem_clusters[key].edge_particles["R"]).min() for key in dem_clusters])
+  total_num = sum([len(dem_clusters[key].edge_particles.index) for key in dem_clusters])
+  print("  Edge particle radius in [%f, %f]" % (rmin, rmax))
+  # add all particles into kdtree
+  xyz = pd.DataFrame(columns=["X","Y","Z"])
+  cluster_id = np.zeros(total_num,dtype=int)
+  cum_num = 0
+  for key in dem_clusters:
+    xyz = pd.concat([xyz, dem_clusters[key].edge_particles[["X","Y","Z"]]])
+    edge_num = len(dem_clusters[key].edge_particles.index)
+    dem_clusters[key].edge_particles["PCDID"] = cum_num + np.array(range(edge_num),dtype=int)
+    cluster_id[cum_num+np.array(range(edge_num),dtype=int)] = key
+    cum_num += edge_num
+  xyz = np.array(xyz)
+  kd_tree = KDTree(xyz)
+
+  # np.savetxt("./data/cluster_id.txt",cluster_id)
+  pairs = kd_tree.query_pairs(r=rmax*2.0,output_type="ndarray")
+  pairs = pairs[cluster_id[pairs[:,0]] != cluster_id[pairs[:,1]],:]
+  for line in range(np.shape(pairs)[0]):
+    i,j = pairs[line,0], pairs[line,1]
+    ikey,jkey = cluster_id[i], cluster_id[j]
+    dist = euclidean(xyz[i,:], xyz[j,:])
+    ix = (dem_clusters[ikey].edge_particles[dem_clusters[ikey].edge_particles["PCDID"]==i]).index[0]
+    jx = (dem_clusters[jkey].edge_particles[dem_clusters[jkey].edge_particles["PCDID"]==j]).index[0]
+    ir = dem_clusters[ikey].edge_particles.loc[ix,"R"]
+    jr = dem_clusters[jkey].edge_particles.loc[jx,"R"]
+    r_sum = ir+jr
+    if r_sum >= dist:
+      ir *= 0.99 * dist / r_sum # (ir+jr)
+      jr *= 0.99 * dist / r_sum # (ir+jr)
+      dem_clusters[ikey].edge_particles.loc[ix,"R"] = ir
+      dem_clusters[jkey].edge_particles.loc[jx,"R"] = jr
+
+  return dem_clusters
+
+
 def handoff(sph_clusters, dist, rmin):
   print("2 Start handoff")
   min_size = 10
-  report_size = 10
-  alpha = 1.0 / (1.0 * dist)
+  report_size = 100
+  # alpha = 1.0 / (1.5 * dist)
   dem_clusters = {}
 
   print("  Generate dem clusters")
   for key in sph_clusters:
+    sph_clusters[key].particles["R"] = 0.5 * dist
     if key < 0 or len(sph_clusters[key].particles.index) < min_size:
-      sph_clusters[key].particles["R"] = 0.5 * dist
       # directly add edge particles and gravitational particles
-      dem_clusters[key] = dem_cluster(key, sph_clusters[key], sph_clusters[key].particles)
+      dem_clusters[key] = dem_cluster(key, sph_clusters[key])
       # Suppose only 1 grav_particle
       particle = sph_clusters[key].particles.iloc[[0]].copy()
       particle.X = sph_clusters[key].pos[0]
@@ -202,9 +265,16 @@ def handoff(sph_clusters, dist, rmin):
       continue
 
     # find sph cluster shape and edge particles
-    alpha_shape_indices = alphashape(sph_clusters[key].particles[["X","Y","Z"]], alpha)
-    edge_particles = sph_clusters[key].particles.iloc[alpha_shape_indices].copy()
-    dem_clusters[key] = dem_cluster(key, sph_clusters[key], edge_particles)
+    # alpha_shape_indices = alphashape(sph_clusters[key].particles[["X","Y","Z"]], alpha)
+    # edge_particles = sph_clusters[key].particles.iloc[alpha_shape_indices].copy()
+    xyz = np.array(sph_clusters[key].particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,1.5*dist)
+    # mesh.compute_vertex_normals()
+    edge_particles = pd.DataFrame(np.asarray(mesh.vertices),columns=["X","Y","Z"])
+
+    dem_clusters[key] = dem_cluster(key, sph_clusters[key], mesh)
 
     inner_particles = sph_clusters[key].particles.copy()
     inner_particles["DIST_EDGE"] = np.inf
@@ -260,7 +330,27 @@ def handoff(sph_clusters, dist, rmin):
     if len(sph_clusters[key].particles.index) >= report_size:
       print("  SPH to DEM: %d -> %d" % (len(sph_clusters[key].particles.index), len(dem_clusters[key].grav_particles.index)))
 
-  for key in dem_clusters: dem_clusters[key].check()
+  print("  Check dem particles")
+  for key in dem_clusters: dem_clusters[key].check(dist, sph_clusters[-1].particles.iloc[0,sph_clusters[-1].particles.columns.get_loc("MASS")])
+
+  print("  Check contact particles")
+  dem_clusters = check_contact(dem_clusters)
+
+  # test only
+  fp = open("./data/edge_particles_pos.txt", "w")
+  for key in dem_clusters:
+    dc = dem_clusters[key]
+    for index in dc.edge_particles.index:
+      fp.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (dc.mass, 0.4*dc.edge_particles.loc[index,"MASS"]*pow(dc.edge_particles.loc[index,"R"],2.0),\
+              dc.edge_particles.loc[index,"X"],dc.edge_particles.loc[index,"Y"],\
+              dc.edge_particles.loc[index,"Z"], dc.edge_particles.loc[index,"R"]))
+
+  print("  Coordinate transform")
+  for key in dem_clusters: dem_clusters[key].transform()
+
+  # # test only
+  # dem_clusters[1].grav_particles.to_csv("./data/test_grav.txt")
+  # dem_clusters[1].edge_particles.to_csv("./data/test_edge.txt")
 
   return dem_clusters
 
@@ -304,6 +394,11 @@ def export_dem(dem_clusters):
   print("  Export %d DEM grav_particles" % sum(dem_grav_pnum))
   print("  Export %d DEM edge_particles" % sum(dem_edge_pnum))
 
+  # report edge particles size
+  rmax = max([(dem_clusters[key].edge_particles["R"]).max() for key in dem_clusters])
+  rmin = min([(dem_clusters[key].edge_particles["R"]).min() for key in dem_clusters])
+  print("  Edge particle radius in [%f, %f]" % (rmin, rmax))
+
   fp1 = open("./data/dem_input/input_assembly_edge.txt", "w")
   fp2 = open("./data/dem_input/input_points_edge.txt", "w")
   fp3 = open("./data/dem_input/input_points_grav.txt", "w")
@@ -313,16 +408,16 @@ def export_dem(dem_clusters):
 
   for key in dem_clusters:
     dc = dem_clusters[key]
-    fp1.write("%d %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e %e\n" % (len(dc.edge_particles.index),\
+    fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (len(dc.edge_particles.index),\
             dc.mass, dc.pi[0],dc.pi[1],dc.pi[2], dc.pos[0],dc.pos[1],dc.pos[2], dc.vel[0],dc.vel[1],dc.vel[2],\
             dc.omg[0],dc.omg[1],dc.omg[2], dc.quat[0],dc.quat[1],dc.quat[2],dc.quat[3]))
     for index in dc.edge_particles.index:
-      fp2.write("%e %e %e %e %e %e\n" % (dc.mass, 0.4*dc.edge_particles.loc[index,"MASS"]*pow(dc.edge_particles.loc[index,"R"],2.0),\
+      fp2.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (dc.mass, 0.4*dc.edge_particles.loc[index,"MASS"]*pow(dc.edge_particles.loc[index,"R"],2.0),\
                dc.edge_particles.loc[index,"X"],dc.edge_particles.loc[index,"Y"],\
                dc.edge_particles.loc[index,"Z"], dc.edge_particles.loc[index,"R"]))
     fp3.write("%d\n" % (len(dc.grav_particles.index)))
     for index in dc.grav_particles.index:
-      fp3.write("%e %e %e %e\n" % (dc.grav_particles.loc[index,"MASS"], dc.grav_particles.loc[index,"X"],dc.grav_particles.loc[index,"Y"],\
+      fp3.write("%.10e %.10e %.10e %.10e\n" % (dc.grav_particles.loc[index,"MASS"], dc.grav_particles.loc[index,"X"],dc.grav_particles.loc[index,"Y"],\
                dc.grav_particles.loc[index,"Z"]))
 
   fp1.close()
