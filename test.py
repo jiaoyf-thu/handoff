@@ -8,6 +8,8 @@ from scipy.spatial.transform import Rotation as R
 import open3d as o3d
 
 
+# # contact detection
+
 # data = pd.read_csv("./data/edge_particles_pos.txt", sep="\s+", header=None, names=["m","i","x","y","z","r"])
 # cluster_id = pd.read_csv("./data/cluster_id.txt", sep="\s+", header=None, names=["cid"])
 # cluster_id = np.array(cluster_id)
@@ -30,6 +32,9 @@ import open3d as o3d
 #   jr = data.loc[j,"r"]
 #   if ir+jr > dist:
 #     print(i,j,ir,jr,ir+jr,dist)
+
+
+# mass check
 
 
 

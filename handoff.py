@@ -87,36 +87,24 @@ def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
   sph_particles = pd.read_csv(path)
   if "MASS" not in sph_particles.columns: sph_particles["MASS"] = mass
   sph_particles["R"] = 0.5 * dist
-  # move to com
-  com_pos = np.array([np.sum(sph_particles["X"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["Y"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["Z"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
-  com_vel = np.array([np.sum(sph_particles["VX"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["VY"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["VZ"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
-  sph_particles["X"] -= com_pos[0]
-  sph_particles["Y"] -= com_pos[1]
-  sph_particles["Z"] -= com_pos[2]
-  sph_particles["VX"] -= com_vel[0]
-  sph_particles["VY"] -= com_vel[1]
-  sph_particles["VZ"] -= com_vel[2]
+  # move to the largest fragment
+  largest = sph_particles[sph_particles.FRAG == 1]
+  largest_pos = np.array([np.sum(largest["X"] * largest["MASS"]),\
+                          np.sum(largest["Y"] * largest["MASS"]),\
+                          np.sum(largest["Z"] * largest["MASS"])]) / np.sum(largest["MASS"])
+  largest_vel = np.array([np.sum(largest["VX"] * largest["MASS"]),\
+                          np.sum(largest["VY"] * largest["MASS"]),\
+                          np.sum(largest["VZ"] * largest["MASS"])]) / np.sum(largest["MASS"])
+  sph_particles["X"] -= largest_pos[0]
+  sph_particles["Y"] -= largest_pos[1]
+  sph_particles["Z"] -= largest_pos[2]
+  sph_particles["VX"] -= largest_vel[0]
+  sph_particles["VY"] -= largest_vel[1]
+  sph_particles["VZ"] -= largest_vel[2]
   # delete too fast particles
   sph_particles["V2COM"] = (sph_particles["VX"]*sph_particles["X"] + sph_particles["VY"]*sph_particles["Y"] + sph_particles["VZ"]*sph_particles["Z"]) /\
                            np.sqrt(sph_particles["X"]*sph_particles["X"] + sph_particles["Y"]*sph_particles["Y"] + sph_particles["Z"]*sph_particles["Z"])
   sph_particles = sph_particles[~((sph_particles.FRAG == -1) & (sph_particles.V2COM >= vmax))]
-  # move to new com
-  com_pos = np.array([np.sum(sph_particles["X"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["Y"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["Z"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
-  com_vel = np.array([np.sum(sph_particles["VX"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["VY"] * sph_particles["MASS"]),\
-                        np.sum(sph_particles["VZ"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
-  sph_particles["X"] -= com_pos[0]
-  sph_particles["Y"] -= com_pos[1]
-  sph_particles["Z"] -= com_pos[2]
-  sph_particles["VX"] -= com_vel[0]
-  sph_particles["VY"] -= com_vel[1]
-  sph_particles["VZ"] -= com_vel[2]
   
   isolated_particles = sph_particles[sph_particles.FRAG == -1]
   clustered_particles = sph_particles[sph_particles.FRAG >= 0]
@@ -337,20 +325,10 @@ def handoff(sph_clusters, dist, rmin):
   dem_clusters = check_contact(dem_clusters)
 
   # test only
-  fp = open("./data/edge_particles_pos.txt", "w")
-  for key in dem_clusters:
-    dc = dem_clusters[key]
-    for index in dc.edge_particles.index:
-      fp.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (dc.mass, 0.4*dc.edge_particles.loc[index,"MASS"]*pow(dc.edge_particles.loc[index,"R"],2.0),\
-              dc.edge_particles.loc[index,"X"],dc.edge_particles.loc[index,"Y"],\
-              dc.edge_particles.loc[index,"Z"], dc.edge_particles.loc[index,"R"]))
+  export_dem_inertial(dem_clusters)
 
   print("  Coordinate transform")
   for key in dem_clusters: dem_clusters[key].transform()
-
-  # # test only
-  # dem_clusters[1].grav_particles.to_csv("./data/test_grav.txt")
-  # dem_clusters[1].edge_particles.to_csv("./data/test_edge.txt")
 
   return dem_clusters
 
@@ -386,7 +364,7 @@ def edt(inner_particles, edge_particles):
   return center, radius, inner_particles
   
 
-def export_dem(dem_clusters):
+def export_dem_transformed(dem_clusters):
   # report handoff results
   dem_grav_pnum = [len(dem_clusters[key].grav_particles.index) for key in dem_clusters]
   dem_edge_pnum = [len(dem_clusters[key].edge_particles.index) for key in dem_clusters]
@@ -425,3 +403,27 @@ def export_dem(dem_clusters):
   fp3.close()
 
   print("4 Done!")
+
+
+def export_dem_inertial(dem_clusters):
+  fp4 = open("./data/dem_input/input_points_edge_inertial.txt", "w")
+  fp5 = open("./data/dem_input/input_points_grav_inertial.txt", "w")
+
+  fp4.write("cluster,x,y,z,r\n")
+  fp5.write("cluster,x,y,z,r\n")
+
+  for key in dem_clusters:
+    dc = dem_clusters[key]
+    for index in dc.edge_particles.index:
+      fp4.write("%d,%.10e,%.10e,%.10e,%.10e\n" % (key, dc.edge_particles.loc[index,"X"],dc.edge_particles.loc[index,"Y"],\
+               dc.edge_particles.loc[index,"Z"], dc.edge_particles.loc[index,"R"]))
+    for index in dc.grav_particles.index:
+      fp5.write("%d,%.10e,%.10e,%.10e,%.10e\n" % (key, dc.grav_particles.loc[index,"X"],dc.grav_particles.loc[index,"Y"],\
+               dc.grav_particles.loc[index,"Z"], dc.grav_particles.loc[index,"R"]))
+
+  fp4.close()
+  fp5.close()
+
+
+def export_edt(inner_particles, num):
+  inner_particles[["X","Y","Z","DIST_EDGE"]].to_csv("./data/dem_input/edt"+str(num)+".txt",index=False)

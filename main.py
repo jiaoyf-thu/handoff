@@ -8,8 +8,8 @@ Here we convert SPH fragments into DEM rigid clusters
 
 
 def test():
-  input_path = "./data/Particles0010.csv" # "./data/test-low.csv" # 
-  dist = 0.5 # 0.001 # 
+  input_path = "./data/test-low.csv" # "./data/Particles0015.csv" # "./data/Particles0010.csv" # "./data/test-low.csv" # 
+  dist = 0.001 # 1.5 # 0.5 # 0.001 # 
   vmax = 0.1
   mass = 250.0
 
@@ -20,7 +20,7 @@ def test():
   dem_clusters = handoff(sph_clusters, dist=dist, rmin=dist)
 
   # export dem input data
-  export_dem(dem_clusters)
+  export_dem_transformed(dem_clusters)
 
 
 if __name__ == "__main__":
