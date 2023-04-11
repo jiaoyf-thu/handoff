@@ -36,7 +36,7 @@ class sph_cluster():
                           self.particles.iloc[0,self.particles.columns.get_loc("VZ")]])
       # self.pos = np.array([self.particles.X, self.particles.Y, self.particles.Z])
       # self.vel = np.array([self.particles.VX, self.particles.VY, self.particles.VZ])
-      self.pi += 2.0/5.0 * self.mass * pow(self.particles.iloc[0,self.particles.columns.get_loc("R")], 2.0)
+      self.pi += 0.4 * self.mass * pow(self.particles.iloc[0,self.particles.columns.get_loc("R")], 2.0)
     else:
       self.mass = np.sum(self.particles.MASS)
       self.pos = np.array([np.sum(self.particles["X"] * self.particles["MASS"]),\
@@ -60,14 +60,14 @@ class sph_cluster():
       self.calc_quaternion()
   
   def calc_inertia_tensor(self, particles, center):
-    pp = pd.DataFrame(columns=["X","Y","Z","MASS"])
-    pp.X = particles.X - center[0]
-    pp.Y = particles.Y - center[1]
-    pp.Z = particles.Z - center[2]
-    pp.MASS = particles.MASS
-    I_xx = ((np.square(pp.Y) + np.square(pp.Z)) * pp.MASS).sum()
-    I_yy = ((np.square(pp.X) + np.square(pp.Z)) * pp.MASS).sum()
-    I_zz = ((np.square(pp.X) + np.square(pp.Y)) * pp.MASS).sum()
+    pp = particles[["X","Y","Z","MASS","R"]].copy()
+    pp.X -= center[0]
+    pp.Y -= center[1]
+    pp.Z -= center[2]
+    Ic = (0.4 * pp.MASS * np.square(pp.R)).sum()
+    I_xx = ((np.square(pp.Y) + np.square(pp.Z)) * pp.MASS).sum() + Ic
+    I_yy = ((np.square(pp.X) + np.square(pp.Z)) * pp.MASS).sum() + Ic
+    I_zz = ((np.square(pp.X) + np.square(pp.Y)) * pp.MASS).sum() + Ic
     I_xy = (-pp.X * pp.Y * pp.MASS).sum()
     I_xz = (-pp.X * pp.Z * pp.MASS).sum()
     I_yz = (-pp.Y * pp.Z * pp.MASS).sum()
@@ -154,13 +154,13 @@ class dem_cluster():
     self.grav_particles.MASS *= coef
     # move edge particles inside and set them larger
     if self.mesh != None:
-      # self.edge_particles = pd.DataFrame(np.asarray(self.mesh.vertices),columns=["X","Y","Z"])
-      # # normals = pd.DataFrame(np.asarray(self.mesh.vertex_normals),columns=["NX","NY","NZ"]) # direction random
-      pcd = o3d.geometry.PointCloud()
-      pcd.points = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices))
-      pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=dist*2.0, max_nn=15), fast_normal_computation=False)
-      pcd.orient_normals_consistent_tangent_plane(k=15)
-      normals = pd.DataFrame(np.asarray(pcd.normals),columns=["NX","NY","NZ"])
+      normals = pd.DataFrame(np.asarray(self.mesh.vertex_normals),columns=["NX","NY","NZ"]) # direction outward
+      # pcd = o3d.geometry.PointCloud()
+      # pcd.points = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices))
+      # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=dist*2.0, max_nn=15), fast_normal_computation=False)
+      # pcd.normalize_normals()
+      # pcd.normals = o3d.utility.Vector3dVector(orient_normals(pcd))
+      # normals = pd.DataFrame(np.asarray(pcd.normals),columns=["NX","NY","NZ"])
       self.edge_particles["X"] -= normals["NX"] * 0.25 * dist
       self.edge_particles["Y"] -= normals["NY"] * 0.25 * dist
       self.edge_particles["Z"] -= normals["NZ"] * 0.25 * dist
@@ -185,6 +185,28 @@ class dem_cluster():
       self.edge_particles.loc[index,"X"] = pos1[0]
       self.edge_particles.loc[index,"Y"] = pos1[1]
       self.edge_particles.loc[index,"Z"] = pos1[2]
+
+
+# # failed! :(
+# def orient_normals(pcd):
+#   points = np.asarray(pcd.points)
+#   normals = np.asarray(pcd.normals)
+#   # breadth first search
+#   kd_tree = KDTree(points)
+#   node=0
+#   visited = []
+#   queue = []
+#   visited.append(node)
+#   queue.append(node)
+#   while queue:
+#     s = queue.pop(0)
+#     dd,ii = kd_tree.query(points[s,:],k=5)
+#     for neighbour in ii:
+#       if neighbour not in visited:
+#         visited.append(neighbour)
+#         queue.append(neighbour)
+#         normals[neighbour,:] *= (-1.0 if np.dot(normals[neighbour,:],normals[s,:])<0.0 else 1.0)
+#   return normals
 
 
 def check_contact(dem_clusters_):
@@ -253,13 +275,26 @@ def handoff(sph_clusters, dist, rmin):
       continue
 
     # find sph cluster shape and edge particles
-    # alpha_shape_indices = alphashape(sph_clusters[key].particles[["X","Y","Z"]], alpha)
-    # edge_particles = sph_clusters[key].particles.iloc[alpha_shape_indices].copy()
     xyz = np.array(sph_clusters[key].particles[["X","Y","Z"]])
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,1.5*dist)
-    # mesh.compute_vertex_normals()
+    mesh.compute_vertex_normals(normalized=True)
+    # orient normals outward
+    normals = np.asarray(mesh.vertex_normals)
+    points = np.asarray(mesh.vertices)
+    kd_tree = KDTree(xyz)
+    _,neighbors = kd_tree.query(points,k=10)
+    for ii in range(points.shape[0]):
+      center = np.mean(xyz[neighbors[ii,:],:],axis=0)
+      normals[ii,:] *= 1.0 if np.dot(normals[ii,:], (points[ii,:]-center)) > 0.0 else -1.0
+    mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+    # # test only
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+    # pcd.normals = o3d.utility.Vector3dVector(mesh.vertex_normals)
+    # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
+
     edge_particles = pd.DataFrame(np.asarray(mesh.vertices),columns=["X","Y","Z"])
 
     dem_clusters[key] = dem_cluster(key, sph_clusters[key], mesh)
