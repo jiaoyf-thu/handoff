@@ -4,8 +4,10 @@ import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist,euclidean
 from scipy.spatial import KDTree
 from scipy.linalg import eigh,inv,norm
+from scipy.interpolate import RBFInterpolator
 from scipy.spatial.transform import Rotation as R
 import open3d as o3d
+import time
 
 
 '''
@@ -80,6 +82,18 @@ class sph_cluster():
     r = R.from_matrix(v)
     self.quat = r.as_quat()
     # print(self.hash, v, r.as_matrix())
+
+  def transform(self):
+    # transfer all particles position into inertia coordinate
+    r = R.from_quat(self.quat)
+    A = (r.as_matrix()).transpose()
+    for index in self.particles.index:
+      pos0 = np.array([self.particles.loc[index,"X"], self.particles.loc[index,"Y"], self.particles.loc[index,"Z"]])
+      pos0 -= self.pos
+      pos1 = np.matmul(A,pos0)
+      self.particles.loc[index,"X"] = pos1[0]
+      self.particles.loc[index,"Y"] = pos1[1]
+      self.particles.loc[index,"Z"] = pos1[2]
 
 
 def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
@@ -462,3 +476,343 @@ def export_dem_inertial(dem_clusters):
 
 def export_edt(inner_particles, num):
   inner_particles[["X","Y","Z","DIST_EDGE"]].to_csv("./data/dem_input/edt"+str(num)+".txt",index=False)
+
+
+def kernel(rij, h):
+  h1 = 1. / h
+  q = rij * h1
+  # get the kernel normalizing factor
+  fac = 1.0 / np.pi * h1 * h1 * h1
+  tmp2 = 2. - q
+  if q > 2.0:
+    val = 0.0
+  elif q > 1.0:
+    val = 0.25 * tmp2 * tmp2 * tmp2
+  else:
+    val = 1 - 1.5 * q * q * (1 - 0.5 * q)
+  return val * fac
+
+
+def sph_interpolation1(sph_particles, dem_particles, hsml, kappa, vlimit2, kernel):
+  sph_particles = sph_particles.copy()
+  dem_particles = dem_particles.copy()
+  # sph_particles["VMOD2"] = sph_particles["VX"]*sph_particles["VX"] + sph_particles["VY"]*sph_particles["VY"] + sph_particles["VZ"]*sph_particles["VZ"]
+  dem_particles["VX"] = 0.0
+  dem_particles["VY"] = 0.0
+  dem_particles["VZ"] = 0.0
+
+  # kernel interpolation
+  print("Interpolating velocity...")
+  # core_particles = sph_particles[sph_particles["VMOD2"] < vlimit2].copy()
+  core_particles = sph_particles[sph_particles["Z"] < hsml*0.5].copy()
+  sph_xyz = core_particles[["X","Y","Z"]].values
+  sph_uvw = core_particles[["VX","VY","VZ"]].values
+  dem_xyz = dem_particles[["X","Y","Z"]].values
+  sph_tree = KDTree(sph_xyz)
+  dem_tree = KDTree(dem_xyz)
+  results = dem_tree.query_ball_tree(sph_tree, r=hsml*kappa)
+  vol = pow(hsml/1.2, 3)
+  for i in range(len(results)):
+    if i%10000 == 0: print("%d/%d" % (i,len(results)))
+    if len(results[i])==0: continue
+    dist = cdist(dem_xyz[i,:].reshape(1,-1),sph_xyz[results[i],:])
+    w = np.array([kernel(dist_, hsml) for dist_ in dist[0]]).transpose()
+    dem_particles.loc[i,["VX","VY","VZ"]] = np.matmul(w, sph_uvw[results[i],:]) * vol
+
+  # add ejceted particles
+  print("Adding ejected particles...")
+  ejeceted_particles = sph_particles[sph_particles["Z"] >= hsml*0.5].copy()
+  ejeceted_particles["R"] = hsml/2.4
+  ejeceted_particles.reset_index(drop=True, inplace=True)
+
+  # check contact
+  print("Checking contact...")
+  rmax = max(dem_particles["R"].max(), ejeceted_particles["R"].max())
+  ejetcted_xyz = ejeceted_particles[["X","Y","Z"]].values
+  ejetcted_tree = KDTree(ejetcted_xyz)
+  results = ejetcted_tree.query_ball_tree(dem_tree, r=rmax*2.0)
+  for i in range(len(results)):
+    if len(results[i])==0: continue
+    ir = ejeceted_particles.loc[i,"R"]
+    dist = cdist(ejetcted_xyz[i,:].reshape(1,-1),dem_xyz[results[i],:])[0]
+    for j in range(len(results[i])):
+      jr = dem_particles.loc[results[i][j],"R"]
+      r_sum = ir+jr
+      if r_sum >= dist[j]:
+        ir *= 0.99 * dist[j] / r_sum
+        jr *= 0.99 * dist[j] / r_sum
+        ejeceted_particles.loc[i,"R"] = ir
+        dem_particles.loc[results[i],"R"] = jr
+  results = ejetcted_tree.query_ball_tree(ejetcted_tree, r=rmax*2.0)
+  for i in range(len(results)):
+    if len(results[i])==0: continue
+    ir = ejeceted_particles.loc[i,"R"]
+    dist = cdist(ejetcted_xyz[i,:].reshape(1,-1),ejetcted_xyz[results[i],:])[0]
+    for j in range(len(results[i])):
+      if results[i][j]==i: continue
+      jr = ejeceted_particles.loc[results[i][j],"R"]
+      r_sum = ir+jr
+      if r_sum >= dist[j]:
+        ir *= 0.99 * dist[j] / r_sum
+        jr *= 0.99 * dist[j] / r_sum
+        ejeceted_particles.loc[i,"R"] = ir
+        ejeceted_particles.loc[results[i][j],"R"] = jr
+
+  dem_particles = pd.concat([dem_particles, ejeceted_particles[["X","Y","Z","R","VX","VY","VZ"]]], ignore_index=True, axis=0)
+  # dem_particles = dem_particles.append(ejeceted_particles[["X","Y","Z","R","VX","VY","VZ"]], ignore_index=True)
+  dem_particles.reset_index(drop=True, inplace=True)
+  print("rmax = %f, rmin = %f" % (dem_particles["R"].max(), dem_particles["R"].min()))
+  
+  return dem_particles
+
+
+def pre_sph_interpolation2(sph_particles, dem_particles, hsml, kappa, vlimit2, kernel):
+  sph_particles = sph_particles.copy()
+  dem_particles = dem_particles.copy()
+  sph_particles["VMOD2"] = sph_particles["VX"]*sph_particles["VX"] + sph_particles["VY"]*sph_particles["VY"] + sph_particles["VZ"]*sph_particles["VZ"]
+
+  # kernel interpolation
+  print("Interpolating velocity...")
+  core_particles = sph_particles[sph_particles["VMOD2"] < vlimit2].copy()
+  core_particles.reset_index(drop=True, inplace=True)
+  sph_xyz = core_particles[["X","Y","Z"]].values
+  sph_uvw = core_particles[["VX","VY","VZ"]].values
+  bed_particles = dem_particles.copy()
+  bed_particles.reset_index(drop=True, inplace=True)
+  dem_xyz = bed_particles[["X","Y","Z"]].values
+  sph_tree = KDTree(sph_xyz)
+  dem_tree = KDTree(dem_xyz)
+  results = dem_tree.query_ball_tree(sph_tree, r=hsml*kappa)
+  vol = pow(hsml/1.2, 3)
+  for i in range(len(results)):
+    if i%10000 == 0: print("%d/%d" % (i,len(results)))
+    if len(results[i])==0:
+      bed_particles.drop(i, inplace=True)
+      continue
+    dist = cdist(dem_xyz[i,:].reshape(1,-1),sph_xyz[results[i],:])
+    w = np.array([kernel(dist_, hsml) for dist_ in dist[0]]).transpose()
+    bed_particles.loc[i,["U","V","W"]] = np.matmul(w, sph_uvw[results[i],:]) * vol
+
+  # export
+  print("Export...")
+  path1 = "./data/sci_impact2/sci_impact2_assembly_bed.csv"
+  path2 = "./data/sci_impact2/sci_impact2_points_bed.csv"
+  fp1 = open(path1, "w")
+  fp2 = open(path2, "w")
+  for index in bed_particles.index:
+    fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (1,\
+            bed_particles.loc[index,"M"], bed_particles.loc[index,"I"], bed_particles.loc[index,"I"], bed_particles.loc[index,"I"], \
+            bed_particles.loc[index,"X"], bed_particles.loc[index,"Y"], bed_particles.loc[index,"Z"], bed_particles.loc[index,"U"], \
+            bed_particles.loc[index,"V"], bed_particles.loc[index,"W"], 0., 0., 0., 0., 0., 0., 1.))
+    fp2.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (bed_particles.loc[index,"M"], bed_particles.loc[index,"I"], \
+              0., 0., 0., bed_particles.loc[index,"R"]))
+  fp1.close()
+  fp2.close()
+  
+  return bed_particles
+
+
+def sph_interpolation2(sph_particles, dem_particles, hsml, kappa, vlimit2, kernel):
+  sph_particles = sph_particles.copy()
+  sph_particles["VMOD2"] = sph_particles["VX"]*sph_particles["VX"] + sph_particles["VY"]*sph_particles["VY"] + sph_particles["VZ"]*sph_particles["VZ"]
+  dem_particles = dem_particles.copy()
+  dem_particles["VX"] = 0.0
+  dem_particles["VY"] = 0.0
+  dem_particles["VZ"] = 0.0
+  dem_particles["PART"] = 0.0
+  sph_particles.reset_index(drop=True, inplace=True)
+  dem_particles.reset_index(drop=True, inplace=True)
+
+  # kernel interpolation
+  print("Interpolating parts...")
+  core_particles = sph_particles[sph_particles["VMOD2"] < vlimit2].copy()
+  # core_particles = sph_particles[sph_particles["Z"] < hsml*0.5].copy()
+  sph_xyz = core_particles[["X","Y","Z"]].values
+  sph_part = core_particles[["PART"]].values
+  dem_xyz = dem_particles[["X","Y","Z"]].values
+  sph_tree = KDTree(sph_xyz)
+  dem_tree = KDTree(dem_xyz)
+  results = dem_tree.query_ball_tree(sph_tree, r=hsml)
+  for i in range(len(results)):
+    if i%10000 == 0: print("%d/%d" % (i,len(results)))
+    if len(results[i])==0: continue
+    dem_particles.loc[i,"PART"] = np.argmax(np.bincount(sph_part[results[i],0]))
+
+  dem_particles["PART"] = np.round(dem_particles["PART"])
+  # dem_particles["PART"] = dem_particles["PART"].astype(int)
+  dem_particles = dem_particles[dem_particles["PART"] > 0].copy()
+  
+  return dem_particles
+
+
+def pre_dem_cluster(dem_particles, rmax, path):
+  martix = dem_particles[dem_particles["PART"]==1].copy()
+  martix.to_csv(path, index=False, mode="w")
+  boulders = {}
+  for part_id in [2,3,4,5]:
+    boulder_particles = dem_particles[dem_particles["PART"]==part_id].copy()
+    boulder_particles["MASS"] = boulder_particles["M"]
+    boulder_particles["VX"] = boulder_particles["U"]
+    boulder_particles["VY"] = boulder_particles["V"]
+    boulder_particles["VZ"] = boulder_particles["W"]
+    boulder_particles_ = boulder_particles.copy()
+    boulders[part_id] = sph_cluster(part_id, boulder_particles)
+    boulders[part_id].calc()
+
+    # first layer
+    print("First layer...")
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge_particles["BID"] = 0
+    for i in range(len(edge_particles)):
+      edge_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge_particles.loc[i,"Z"])].index[0]
+
+    # second layer
+    print("Second layer...")
+    boulder_particles.drop(edge_particles["BID"], inplace=True)
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge2_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge2_particles["BID"] = 0
+    for i in range(len(edge2_particles)):
+      edge2_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge2_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge2_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge2_particles.loc[i,"Z"])].index[0]
+    edge_particles = pd.concat([edge_particles, edge2_particles], ignore_index=True)
+
+    # third layer
+    print("Third layer...")
+    boulder_particles.drop(edge2_particles["BID"], inplace=True)
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge3_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge3_particles["BID"] = 0
+    for i in range(len(edge3_particles)):
+      edge3_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge3_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge3_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge3_particles.loc[i,"Z"])].index[0]
+    edge_particles = pd.concat([edge_particles, edge3_particles], ignore_index=True)
+
+    edge_particles["R"] = boulder_particles_.loc[edge_particles["BID"],"R"].values
+    edge_particles["M"] = boulder_particles_.loc[edge_particles["BID"],"M"].values
+    edge_particles["I"] = boulder_particles_.loc[edge_particles["BID"],"I"].values
+    edge_particles["U"] = 0.0
+    edge_particles["V"] = 0.0
+    edge_particles["W"] = 0.0
+    edge_particles["W1"] = 0.0
+    edge_particles["W2"] = 0.0
+    edge_particles["W3"] = 0.0
+    edge_particles["PART"] = part_id
+    edge_particles = edge_particles[["M","I","X","Y","Z","U","V","W","W1","W2","W3","R","PART"]]
+    boulders[part_id].particles = edge_particles
+    # boulders[part_id].transform()
+    boulders[part_id].particles.to_csv(path, index=False, header=False, mode="a")
+
+
+def pre_dem_cluster_transform(dem_particles, rmax, path1, path2):
+  martix = dem_particles[dem_particles["PART"]==1].copy()
+  boulders = {}
+  for part_id in [2,3,4,5]:
+    boulder_particles = dem_particles[dem_particles["PART"]==part_id].copy()
+    boulder_particles["MASS"] = boulder_particles["M"]
+    boulder_particles["VX"] = boulder_particles["U"]
+    boulder_particles["VY"] = boulder_particles["V"]
+    boulder_particles["VZ"] = boulder_particles["W"]
+    boulder_particles_ = boulder_particles.copy()
+    boulders[part_id] = sph_cluster(part_id, boulder_particles)
+    boulders[part_id].calc()
+
+    # first layer
+    print("First layer...")
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge_particles["BID"] = 0
+    for i in range(len(edge_particles)):
+      edge_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge_particles.loc[i,"Z"])].index[0]
+
+    # second layer
+    print("Second layer...")
+    boulder_particles.drop(edge_particles["BID"], inplace=True)
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge2_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge2_particles["BID"] = 0
+    for i in range(len(edge2_particles)):
+      edge2_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge2_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge2_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge2_particles.loc[i,"Z"])].index[0]
+    edge_particles = pd.concat([edge_particles, edge2_particles], ignore_index=True)
+
+    # third layer
+    print("Third layer...")
+    boulder_particles.drop(edge2_particles["BID"], inplace=True)
+    xyz = np.array(boulder_particles[["X","Y","Z"]])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*rmax)
+    edge3_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge3_particles["BID"] = 0
+    for i in range(len(edge3_particles)):
+      edge3_particles.loc[i,"BID"] = boulder_particles_[(boulder_particles_["X"]==edge3_particles.loc[i,"X"]) & \
+        (boulder_particles_["Y"]==edge3_particles.loc[i,"Y"]) & \
+        (boulder_particles_["Z"]==edge3_particles.loc[i,"Z"])].index[0]
+    edge_particles = pd.concat([edge_particles, edge3_particles], ignore_index=True)
+
+    edge_particles["R"] = boulder_particles_.loc[edge_particles["BID"],"R"].values
+    edge_particles["M"] = boulder_particles_.loc[edge_particles["BID"],"M"].values
+    edge_particles["I"] = boulder_particles_.loc[edge_particles["BID"],"I"].values
+    edge_particles["U"] = 0.0
+    edge_particles["V"] = 0.0
+    edge_particles["W"] = 0.0
+    edge_particles["W1"] = 0.0
+    edge_particles["W2"] = 0.0
+    edge_particles["W3"] = 0.0
+    edge_particles["PART"] = part_id
+    edge_particles = edge_particles[["M","I","X","Y","Z","U","V","W","W1","W2","W3","R","PART"]]
+    boulders[part_id].particles = edge_particles
+    boulders[part_id].transform()
+
+  # export
+  print("Export...")
+  fp1 = open(path1, "w")
+  fp2 = open(path2, "w")
+  fp1.write("%d\n" % (len(boulders)+len(martix.index)))
+  for key in boulders:
+    dc = boulders[key]
+    # fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (len(dc.particles.index),\
+    #         dc.mass, dc.pi[0],dc.pi[1],dc.pi[2], dc.pos[0],dc.pos[1],dc.pos[2], dc.vel[0],dc.vel[1],dc.vel[2],\
+    #         dc.omg[0],dc.omg[1],dc.omg[2], dc.quat[0],dc.quat[1],dc.quat[2],dc.quat[3]))
+    fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (len(dc.particles.index),\
+            dc.mass, dc.pi[0],dc.pi[1],dc.pi[2], dc.pos[0],dc.pos[1],dc.pos[2], 0., 0., 0., 0., 0., 0., dc.quat[0],dc.quat[1],dc.quat[2],dc.quat[3]))
+    for index in dc.particles.index:
+      fp2.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (dc.mass, 0.4*dc.particles.loc[index,"M"]*pow(dc.particles.loc[index,"R"],2.0),\
+               dc.particles.loc[index,"X"],dc.particles.loc[index,"Y"], dc.particles.loc[index,"Z"], dc.particles.loc[index,"R"]))
+  for index in martix.index:
+    # fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (1,\
+    #         martix.loc[index,"M"], martix.loc[index,"I"], martix.loc[index,"I"], martix.loc[index,"I"], \
+    #         martix.loc[index,"X"], martix.loc[index,"Y"], martix.loc[index,"Z"], martix.loc[index,"U"], \
+    #         martix.loc[index,"V"], martix.loc[index,"W"], 0., 0., 0., 0., 0., 0., 1.))
+    fp1.write("%d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n" % (1,\
+            martix.loc[index,"M"], martix.loc[index,"I"], martix.loc[index,"I"], martix.loc[index,"I"], \
+            martix.loc[index,"X"], martix.loc[index,"Y"], martix.loc[index,"Z"], 0., 0., 0., 0., 0., 0., 0., 0., 0., 1.))
+    fp2.write("%.10e %.10e %.10e %.10e %.10e %.10e\n" % (martix.loc[index,"M"], martix.loc[index,"I"], \
+              0., 0., 0., martix.loc[index,"R"]))
+  fp1.close()
+  fp2.close()
+  
