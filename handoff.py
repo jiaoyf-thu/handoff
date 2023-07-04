@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist,euclidean
-from scipy.spatial import KDTree
+from scipy.spatial import KDTree,Delaunay
 from scipy.linalg import eigh,inv,norm
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial.transform import Rotation as R
@@ -36,6 +36,7 @@ class sph_cluster():
       self.vel = np.array([self.particles.iloc[0,self.particles.columns.get_loc("VX")], \
                           self.particles.iloc[0,self.particles.columns.get_loc("VY")],\
                           self.particles.iloc[0,self.particles.columns.get_loc("VZ")]])
+      # if self.hash==-1 : print(self.hash, self.pos, self.vel)
       # self.pos = np.array([self.particles.X, self.particles.Y, self.particles.Z])
       # self.vel = np.array([self.particles.VX, self.particles.VY, self.particles.VZ])
       self.pi += 0.4 * self.mass * pow(self.particles.iloc[0,self.particles.columns.get_loc("R")], 2.0)
@@ -47,6 +48,7 @@ class sph_cluster():
       self.vel = np.array([np.sum(self.particles["VX"] * self.particles["MASS"]),\
                           np.sum(self.particles["VY"] * self.particles["MASS"]),\
                           np.sum(self.particles["VZ"] * self.particles["MASS"])]) / self.mass
+      # print(self.hash, self.pos, self.vel)
       Lox = (self.particles["Y"] * self.particles["VZ"] - self.particles["Z"] * self.particles["VY"]) * self.particles["MASS"]
       Loy = (self.particles["Z"] * self.particles["VX"] - self.particles["X"] * self.particles["VZ"]) * self.particles["MASS"]
       Loz = (self.particles["X"] * self.particles["VY"] - self.particles["Y"] * self.particles["VX"]) * self.particles["MASS"]
@@ -96,19 +98,35 @@ class sph_cluster():
       self.particles.loc[index,"Z"] = pos1[2]
 
 
-def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
+def load_sph_particles(path, dist, vmax=1.0, mass=1.0, omg=np.zeros(3), move2center=True):
   print("1 Load sph particles")
   sph_particles = pd.read_csv(path)
   if "MASS" not in sph_particles.columns: sph_particles["MASS"] = mass
   sph_particles["R"] = 0.5 * dist
+
+  # add an initial rotation: omg cross pos
+  sph_particles["VX"] += omg[1] * sph_particles["Z"] - omg[2] * sph_particles["Y"]
+  sph_particles["VY"] += omg[2] * sph_particles["X"] - omg[0] * sph_particles["Z"]
+  sph_particles["VZ"] += omg[0] * sph_particles["Y"] - omg[1] * sph_particles["X"]
+
   # move to the largest fragment
   largest = sph_particles[sph_particles.FRAG == 1]
-  largest_pos = np.array([np.sum(largest["X"] * largest["MASS"]),\
-                          np.sum(largest["Y"] * largest["MASS"]),\
-                          np.sum(largest["Z"] * largest["MASS"])]) / np.sum(largest["MASS"])
-  largest_vel = np.array([np.sum(largest["VX"] * largest["MASS"]),\
-                          np.sum(largest["VY"] * largest["MASS"]),\
-                          np.sum(largest["VZ"] * largest["MASS"])]) / np.sum(largest["MASS"])
+  if len(largest) > 0 and move2center:
+    largest_pos = np.array([np.sum(largest["X"] * largest["MASS"]),\
+                            np.sum(largest["Y"] * largest["MASS"]),\
+                            np.sum(largest["Z"] * largest["MASS"])]) / np.sum(largest["MASS"])
+    largest_vel = np.array([np.sum(largest["VX"] * largest["MASS"]),\
+                            np.sum(largest["VY"] * largest["MASS"]),\
+                            np.sum(largest["VZ"] * largest["MASS"])]) / np.sum(largest["MASS"])
+  else:
+    largest_pos = np.array([np.sum(sph_particles["X"] * sph_particles["MASS"]),\
+                            np.sum(sph_particles["Y"] * sph_particles["MASS"]),\
+                            np.sum(sph_particles["Z"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+    largest_vel = np.array([np.sum(sph_particles["VX"] * sph_particles["MASS"]),\
+                            np.sum(sph_particles["VY"] * sph_particles["MASS"]),\
+                            np.sum(sph_particles["VZ"] * sph_particles["MASS"])]) / np.sum(sph_particles["MASS"])
+  print("Largest fragment pos: ", largest_pos)
+  print("Largest fragment vel: ", largest_vel)
   sph_particles["X"] -= largest_pos[0]
   sph_particles["Y"] -= largest_pos[1]
   sph_particles["Z"] -= largest_pos[2]
@@ -116,9 +134,11 @@ def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
   sph_particles["VY"] -= largest_vel[1]
   sph_particles["VZ"] -= largest_vel[2]
   # delete too fast particles
-  sph_particles["V2COM"] = (sph_particles["VX"]*sph_particles["X"] + sph_particles["VY"]*sph_particles["Y"] + sph_particles["VZ"]*sph_particles["Z"]) /\
-                           np.sqrt(sph_particles["X"]*sph_particles["X"] + sph_particles["Y"]*sph_particles["Y"] + sph_particles["Z"]*sph_particles["Z"])
-  sph_particles = sph_particles[~((sph_particles.FRAG == -1) & (sph_particles.V2COM >= vmax))]
+  # sph_particles["V2COM"] = (sph_particles["VX"]*sph_particles["X"] + sph_particles["VY"]*sph_particles["Y"] + sph_particles["VZ"]*sph_particles["Z"]) /\
+  #                          np.sqrt(sph_particles["X"]*sph_particles["X"] + sph_particles["Y"]*sph_particles["Y"] + sph_particles["Z"]*sph_particles["Z"])
+  # sph_particles = sph_particles[~((sph_particles.FRAG == -1) & (sph_particles.V2COM >= vmax))]
+  sph_particles["VMOD2"] = sph_particles["VX"]*sph_particles["VX"] + sph_particles["VY"]*sph_particles["VY"] + sph_particles["VZ"]*sph_particles["VZ"]
+  sph_particles = sph_particles[~((sph_particles.FRAG == -1) & (sph_particles.VMOD2 >= vmax*vmax))]
   
   isolated_particles = sph_particles[sph_particles.FRAG == -1]
   clustered_particles = sph_particles[sph_particles.FRAG >= 0]
@@ -137,6 +157,7 @@ def load_sph_particles(path, dist, vmax=1.0, mass=1.0):
     hash -= 1
 
   print("  Input %d SPH particles" % len(sph_particles.index))
+  print("  Input %d SPH clusters" % len(sph_clusters))
 
   return sph_clusters
 
@@ -154,10 +175,11 @@ class dem_cluster():
     self.quat = sph_cluster_.quat # quaternions: in scalar-last (x, y, z, w) format
     self.pi   = sph_cluster_.pi   # principle interia
     self.mesh = mesh
-    if self.mesh == None:
-      self.edge_particles = sph_cluster_.particles
-    else:
-      self.edge_particles = pd.DataFrame(np.asarray(self.mesh.vertices),columns=["X","Y","Z"])
+    # if self.mesh == None:
+    #   self.edge_particles = sph_cluster_.particles
+    # else:
+    #   self.edge_particles = pd.DataFrame(np.asarray(self.mesh.vertices),columns=["X","Y","Z"])
+    self.edge_particles = mesh[["X","Y","Z"]]
 
   def add_particle(self, particle):
     self.grav_particles = pd.concat([self.grav_particles, particle])
@@ -166,20 +188,23 @@ class dem_cluster():
     # modify mass distribution
     coef = self.mass / sum(self.grav_particles.MASS)
     self.grav_particles.MASS *= coef
-    # move edge particles inside and set them larger
-    if self.mesh != None:
-      normals = pd.DataFrame(np.asarray(self.mesh.vertex_normals),columns=["NX","NY","NZ"]) # direction outward
-      # pcd = o3d.geometry.PointCloud()
-      # pcd.points = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices))
-      # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=dist*2.0, max_nn=15), fast_normal_computation=False)
-      # pcd.normalize_normals()
-      # pcd.normals = o3d.utility.Vector3dVector(orient_normals(pcd))
-      # normals = pd.DataFrame(np.asarray(pcd.normals),columns=["NX","NY","NZ"])
-      self.edge_particles["X"] -= normals["NX"] * 0.25 * dist
-      self.edge_particles["Y"] -= normals["NY"] * 0.25 * dist
-      self.edge_particles["Z"] -= normals["NZ"] * 0.25 * dist
-      self.edge_particles["R"] = 0.75 * dist
-      self.edge_particles["MASS"] = mass
+
+    self.edge_particles["R"] = 0.5 * dist
+    self.edge_particles["MASS"] = mass
+    # # move edge particles inside and set them larger
+    # if self.mesh != None:
+    #   normals = pd.DataFrame(np.asarray(self.mesh.vertex_normals),columns=["NX","NY","NZ"]) # direction outward
+    #   # pcd = o3d.geometry.PointCloud()
+    #   # pcd.points = o3d.utility.Vector3dVector(np.asarray(self.mesh.vertices))
+    #   # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=dist*2.0, max_nn=15), fast_normal_computation=False)
+    #   # pcd.normalize_normals()
+    #   # pcd.normals = o3d.utility.Vector3dVector(orient_normals(pcd))
+    #   # normals = pd.DataFrame(np.asarray(pcd.normals),columns=["NX","NY","NZ"])
+    #   self.edge_particles["X"] -= normals["NX"] * 0.25 * dist
+    #   self.edge_particles["Y"] -= normals["NY"] * 0.25 * dist
+    #   self.edge_particles["Z"] -= normals["NZ"] * 0.25 * dist
+    #   self.edge_particles["R"] = 0.75 * dist
+    #   self.edge_particles["MASS"] = mass
 
   def transform(self):
     # transfer all particles position into inertia coordinate
@@ -271,12 +296,26 @@ def handoff(sph_clusters, dist, rmin):
   # alpha = 1.0 / (1.5 * dist)
   dem_clusters = {}
 
+  # record the first point from each cluster
+  points_to_test = pd.DataFrame([sph_clusters[key].particles.iloc[0][["X", "Y", "Z"]] for key in sph_clusters], columns=["X", "Y", "Z"])
+  points_to_test.set_index(pd.Index([key for key in sph_clusters]), inplace=True)
+  points_to_test["is_inside"] = False
+  key_inside = []
+
   print("  Generate dem clusters")
   for key in sph_clusters:
+    # ignore inside clusters
+    if key in key_inside: continue
+
+    # ignore too fast rotating clusters
+    if norm(sph_clusters[key].omg) > 10.0:
+      print("  Cluster %d is rotating too fast" % key)
+      continue
+
     sph_clusters[key].particles["R"] = 0.5 * dist
     if key < 0 or len(sph_clusters[key].particles.index) < min_size:
       # directly add edge particles and gravitational particles
-      dem_clusters[key] = dem_cluster(key, sph_clusters[key])
+      dem_clusters[key] = dem_cluster(key, sph_clusters[key], sph_clusters[key].particles[["X","Y","Z"]])
       # Suppose only 1 grav_particle
       particle = sph_clusters[key].particles.iloc[[0]].copy()
       particle.X = sph_clusters[key].pos[0]
@@ -289,29 +328,56 @@ def handoff(sph_clusters, dist, rmin):
       continue
 
     # find sph cluster shape and edge particles
-    xyz = np.array(sph_clusters[key].particles[["X","Y","Z"]])
+    xyz = (sph_clusters[key].particles[["X","Y","Z"]]).copy()
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz)
-    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,1.5*dist)
-    mesh.compute_vertex_normals(normalized=True)
-    # orient normals outward
-    normals = np.asarray(mesh.vertex_normals)
-    points = np.asarray(mesh.vertices)
-    kd_tree = KDTree(xyz)
-    _,neighbors = kd_tree.query(points,k=10)
-    for ii in range(points.shape[0]):
-      center = np.mean(xyz[neighbors[ii,:],:],axis=0)
-      normals[ii,:] *= 1.0 if np.dot(normals[ii,:], (points[ii,:]-center)) > 0.0 else -1.0
-    mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
-    # # test only
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
-    # pcd.normals = o3d.utility.Vector3dVector(mesh.vertex_normals)
-    # o3d.visualization.draw_geometries([pcd], point_show_normal=True)
+    pcd.points = o3d.utility.Vector3dVector(np.array(xyz))
+    # mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,1.5*dist)
+    # mesh.compute_vertex_normals(normalized=True)
+    # # orient normals outward
+    # normals = np.asarray(mesh.vertex_normals)
+    # points = np.asarray(mesh.vertices)
+    # kd_tree = KDTree(xyz)
+    # _,neighbors = kd_tree.query(points,k=10)
+    # for ii in range(points.shape[0]):
+    #   center = np.mean(xyz[neighbors[ii,:],:],axis=0)
+    #   normals[ii,:] *= 1.0 if np.dot(normals[ii,:], (points[ii,:]-center)) > 0.0 else -1.0
+    # mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
 
-    edge_particles = pd.DataFrame(np.asarray(mesh.vertices),columns=["X","Y","Z"])
+    # first layer
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,2.0*dist) #1.5*dist)
+    edge_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+    edge_particles_ = edge_particles.copy()
+    edge_particles["BID"] = 0
+    for i in range(len(edge_particles)):
+      edge_particles.loc[i,"BID"] = xyz[(xyz["X"]==edge_particles.loc[i,"X"]) & \
+        (xyz["Y"]==edge_particles.loc[i,"Y"]) & \
+        (xyz["Z"]==edge_particles.loc[i,"Z"])].index[0]
 
-    dem_clusters[key] = dem_cluster(key, sph_clusters[key], mesh)
+    # remove inside particles or fragments
+    scene = o3d.t.geometry.RaycastingScene()
+    mesh.remove_unreferenced_vertices()
+    mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    _ = scene.add_triangles(mesh)
+    points_to_test['is_inside'] = scene.compute_occupancy(o3d.core.Tensor(points_to_test[['X','Y','Z']].values, dtype=o3d.core.Dtype.Float32)) > 0
+    points_to_test.loc[key,'is_inside'] = False # ignore itself
+    key_inside += points_to_test[points_to_test['is_inside']==True].index.tolist()
+
+    # second layer
+    xyz.drop(edge_particles["BID"], inplace=True)
+    if len(xyz.index) > 4:
+      pcd = o3d.geometry.PointCloud()
+      pcd.points = o3d.utility.Vector3dVector(np.array(xyz))
+      mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd,1.5*dist)
+      edge2_particles = pd.DataFrame(np.asarray(mesh.vertices), columns=["X","Y","Z"])
+      edge_particles = pd.concat([edge_particles, edge2_particles], ignore_index=True)
+      dem_clusters[key] = dem_cluster(key, sph_clusters[key], edge_particles)
+    else:
+      dem_clusters[key] = dem_cluster(key, sph_clusters[key], sph_clusters[key].particles[["X","Y","Z"]])
+    
+    edge_particles = edge_particles_.copy()
+
+    # edge_particles = pd.DataFrame(np.asarray(mesh.vertices),columns=["X","Y","Z"])
+    # dem_clusters[key] = dem_cluster(key, sph_clusters[key], mesh)
 
     inner_particles = sph_clusters[key].particles.copy()
     inner_particles["DIST_EDGE"] = np.inf
@@ -426,9 +492,9 @@ def export_dem_transformed(dem_clusters):
   rmin = min([(dem_clusters[key].edge_particles["R"]).min() for key in dem_clusters])
   print("  Edge particle radius in [%f, %f]" % (rmin, rmax))
 
-  fp1 = open("./data/dem_input/input_assembly_edge.txt", "w")
-  fp2 = open("./data/dem_input/input_points_edge.txt", "w")
-  fp3 = open("./data/dem_input/input_points_grav.txt", "w")
+  fp1 = open("./data/dem_input/input_assembly.txt", "w")
+  fp2 = open("./data/dem_input/input_points.txt", "w")
+  fp3 = open("./data/dem_input/input_points_interior.txt", "w")
 
   fp1.write("%d\n" % (len(dem_clusters)))
   fp3.write("%d\n" % (sum(dem_grav_pnum)))
