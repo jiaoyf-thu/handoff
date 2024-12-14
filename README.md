@@ -3,5 +3,4 @@ This code is for SPH-DEM transition when simulating a rubble-pile impact scenari
 
 ## Contact Info
 Yifei Jiao (PhD student), Tsinghua University, Beijing, China (Email: jiaoyf.thu@gmail.com)
-
 Any feedback is highly appreciated.
