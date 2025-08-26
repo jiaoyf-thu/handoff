@@ -4,6 +4,6 @@ This code is for the SPH-DEM transition when simulating a rubble-pile asteroid i
 
 ## Contact Info
 
-Yifei Jiao (PhD student), Tsinghua University, Beijing, China (Email: jiaoyf.thu@gmail.com)
+Yifei Jiao (PhD), Tsinghua University, Beijing, China (Email: jiaoyf.thu@gmail.com)
 
 Any feedback is highly appreciated.
